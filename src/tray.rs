@@ -3,11 +3,181 @@ use crate::client::translate;
 use crate::ipc::Data;
 #[cfg(windows)]
 use hbb_common::tokio;
-use hbb_common::{allow_err, log};
+use hbb_common::{allow_err, config::PeerConfig, log};
 use base::config::keys;
 use std::sync::{Arc, Mutex};
 #[cfg(windows)]
 use std::time::Duration;
+
+/// Maximum number of recent sessions listed in the tray menu.
+const RECENT_LIMIT: usize = 5;
+/// How often the recent session list is refreshed.
+const RECENT_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// Menu id prefix of a recent session entry, the peer id follows it.
+const RECENT_ITEM_ID_PREFIX: &str = "tray-recent:";
+/// Menu id of the disabled entry shown when there is no recent session.
+const RECENT_EMPTY_ITEM_ID: &str = "tray-recent-empty";
+/// Maximum length of a recent session label.
+const RECENT_LABEL_MAX_LEN: usize = 40;
+
+/// A peer of a recent session, shown in the tray menu.
+#[derive(Clone, PartialEq)]
+struct RecentPeer {
+    id: String,
+    label: String,
+}
+
+/// The peers of the most recent outgoing sessions, newest first.
+///
+/// The source is the same as the "Recent sessions" tab of the main window,
+/// the peer config files sorted by their modification time.
+fn recent_peers() -> Vec<RecentPeer> {
+    let list = PeerConfig::get_vec_id_modified_time_path(&None);
+    let (peers, _) = PeerConfig::batch_peers(&list, 0, Some(RECENT_LIMIT));
+    let mut peers: Vec<RecentPeer> = peers
+        .into_iter()
+        .filter(|(id, _, _)| is_url_safe_id(id))
+        .map(|(id, _, config)| {
+            let label = peer_label(&id, &config);
+            RecentPeer { id, label }
+        })
+        .collect();
+    disambiguate_labels(&mut peers);
+    peers
+}
+
+/// The name of a peer, the same precedence as the peer cards of the main window.
+fn peer_label(id: &str, config: &PeerConfig) -> String {
+    let alias = config.options.get("alias").map(|s| s.trim()).unwrap_or("");
+    if !alias.is_empty() {
+        return alias.to_owned();
+    }
+    let hostname = config.info.hostname.trim();
+    let username = config.info.username.trim();
+    if !hostname.is_empty() {
+        if !username.is_empty() {
+            return format!("{username}@{hostname}");
+        }
+        return hostname.to_owned();
+    }
+    format_id(id)
+}
+
+/// Append the peer id to the entries that can not be told apart by their label.
+fn disambiguate_labels(peers: &mut [RecentPeer]) {
+    let labels: Vec<String> = peers.iter().map(|p| p.label.clone()).collect();
+    for (i, peer) in peers.iter_mut().enumerate() {
+        let key = normalize_label(&labels[i]);
+        let duplicated = labels
+            .iter()
+            .filter(|l| normalize_label(l.as_str()) == key)
+            .count()
+            > 1;
+        if duplicated && peer.label != format_id(&peer.id) {
+            peer.label = format!("{} ({})", peer.label, format_id(&peer.id));
+        }
+    }
+}
+
+fn normalize_label(label: &str) -> String {
+    label.trim().to_lowercase()
+}
+
+/// Group a numeric id in blocks of three, the way the main window shows it.
+fn format_id(id: &str) -> String {
+    let trimmed = id.trim();
+    if trimmed.is_empty() || !trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return id.to_owned();
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    let len = chars.len();
+    let first = if len % 3 == 0 { 3 } else { len % 3 };
+    let mut formatted = String::with_capacity(len + len / 3);
+    formatted.extend(chars[..first].iter());
+    for chunk in chars[first..].chunks(3) {
+        formatted.push(' ');
+        formatted.extend(chunk.iter());
+    }
+    formatted
+}
+
+/// The peer id is sent to the main window in a url, an id that needs percent
+/// encoding can not be decoded back by the url handler.
+fn is_url_safe_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// Make a peer name fit a menu entry.
+fn sanitize_menu_text(text: &str) -> String {
+    let mut sanitized = text
+        .replace('&', "&&")
+        .replace('\n', " ")
+        .replace('\r', " ")
+        .replace('\t', " ");
+    if sanitized.chars().count() > RECENT_LABEL_MAX_LEN {
+        sanitized = sanitized.chars().take(RECENT_LABEL_MAX_LEN).collect();
+        sanitized.push('…');
+    }
+    sanitized
+}
+
+/// Replace the entries of the recent session submenu.
+fn update_recent_menu(submenu: &tray_icon::menu::Submenu, peers: &[RecentPeer]) {
+    use tray_icon::menu::MenuItem;
+    while submenu.remove_at(0).is_some() {}
+    if peers.is_empty() {
+        let item = MenuItem::with_id(
+            RECENT_EMPTY_ITEM_ID,
+            translate("No recent sessions".to_owned()),
+            false,
+            None,
+        );
+        submenu.append(&item).ok();
+        return;
+    }
+    for peer in peers {
+        let item = MenuItem::with_id(
+            format!("{RECENT_ITEM_ID_PREFIX}{}", peer.id),
+            sanitize_menu_text(&peer.label),
+            true,
+            None,
+        );
+        submenu.append(&item).ok();
+    }
+}
+
+/// Hand a url over to the main window, it opens the connection it points to.
+///
+/// Returns false when there is no main window to receive it.
+#[cfg(target_os = "linux")]
+fn try_deliver_url(url: &str) -> bool {
+    crate::dbus::invoke_new_connection(url.to_owned()).is_ok()
+}
+
+#[cfg(windows)]
+fn try_deliver_url(url: &str) -> bool {
+    use winapi::um::winuser::WM_USER;
+    crate::platform::send_message_to_hnwd(
+        &crate::platform::FLUTTER_RUNNER_WIN32_WINDOW_CLASS,
+        &crate::get_app_name(),
+        (WM_USER + 2) as _, // referred from unilinks desktop pub
+        url,
+        false,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn try_deliver_url(url: &str) -> bool {
+    crate::ipc::send_url_scheme(url.to_owned()).is_ok()
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+fn try_deliver_url(_url: &str) -> bool {
+    false
+}
 
 pub fn start_tray() {
     if crate::ui_interface::get_builtin_option(keys::OPTION_HIDE_TRAY) == "Y" {
@@ -28,7 +198,7 @@ fn make_tray() -> hbb_common::ResultType<()> {
     use hbb_common::anyhow::Context;
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
     use tray_icon::{
-        menu::{Menu, MenuEvent, MenuItem},
+        menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
         TrayIcon, TrayIconBuilder, TrayIconEvent as TrayEvent,
     };
 
@@ -75,10 +245,18 @@ fn make_tray() -> hbb_common::ResultType<()> {
         None
     };
     let open_i = MenuItem::new(translate("Open".to_owned()), true, None);
+    let separator_i = PredefinedMenuItem::separator();
+    let recent_menu = Submenu::new(translate("Recent sessions".to_owned()), true);
+    let initial_recent = recent_peers();
+    update_recent_menu(&recent_menu, &initial_recent);
     if let Some(quit_i) = &quit_i {
-        tray_menu.append_items(&[&open_i, quit_i]).ok();
+        tray_menu
+            .append_items(&[&recent_menu, &separator_i, &open_i, quit_i])
+            .ok();
     } else {
-        tray_menu.append_items(&[&open_i]).ok();
+        tray_menu
+            .append_items(&[&recent_menu, &separator_i, &open_i])
+            .ok();
     }
     let tooltip = |count: usize| {
         if count == 0 {
@@ -128,6 +306,51 @@ fn make_tray() -> hbb_common::ResultType<()> {
             }
         }
     };
+
+    // Open the session of a recent peer in the main window.
+    let open_recent_peer = {
+        let open_func = open_func;
+        move |id: String| {
+            let url = format!("{}connect/{}", crate::get_uri_prefix(), id);
+            std::thread::spawn(move || {
+                if try_deliver_url(&url) {
+                    return;
+                }
+                // There is no main window yet, open it and hand over the url
+                // as soon as it is there.
+                open_func();
+                for _ in 0..20 {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    if try_deliver_url(&url) {
+                        return;
+                    }
+                }
+                log::warn!("Failed to open the recent session from the tray menu");
+            });
+        }
+    };
+
+    // Keep the recent session list up to date, it is read from the peer
+    // config files that the main window writes.
+    let (recent_sender, recent_receiver) = std::sync::mpsc::channel::<Vec<RecentPeer>>();
+    if let Err(err) = std::thread::Builder::new()
+        .name("recent-peers-watcher".to_owned())
+        .spawn(move || {
+            let mut last = initial_recent;
+            loop {
+                std::thread::sleep(RECENT_REFRESH_INTERVAL);
+                let peers = recent_peers();
+                if peers != last {
+                    last = peers.clone();
+                    if recent_sender.send(peers).is_err() {
+                        return;
+                    }
+                }
+            }
+        })
+    {
+        log::warn!("Failed to start the recent peers watcher: {err}");
+    }
 
     #[cfg(windows)]
     std::thread::spawn(move || {
@@ -187,8 +410,14 @@ fn make_tray() -> hbb_common::ResultType<()> {
             }
         }
 
+        if let Ok(peers) = recent_receiver.try_recv() {
+            update_recent_menu(&recent_menu, &peers);
+        }
+
         if let Ok(event) = menu_channel.try_recv() {
-            if let Some(quit_i) = &quit_i {
+            if let Some(id) = event.id.0.strip_prefix(RECENT_ITEM_ID_PREFIX) {
+                open_recent_peer(id.to_owned());
+            } else if let Some(quit_i) = &quit_i {
                 if event.id == quit_i.id() {
                     /* failed in windows, seems no permission to check system process
                     if !crate::check_process("--server", false) {
@@ -315,4 +544,57 @@ fn load_icon_from_asset() -> Option<image::DynamicImage> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(id: &str, label: &str) -> RecentPeer {
+        RecentPeer {
+            id: id.to_owned(),
+            label: label.to_owned(),
+        }
+    }
+
+    #[test]
+    fn format_id_groups_digits_in_three() {
+        assert_eq!(format_id("123456789"), "123 456 789");
+        assert_eq!(format_id("12345"), "12 345");
+        assert_eq!(format_id("123"), "123");
+        assert_eq!(format_id("1234"), "1 234");
+        assert_eq!(format_id("abc"), "abc");
+        assert_eq!(format_id(""), "");
+    }
+
+    #[test]
+    fn duplicated_labels_get_the_id_appended() {
+        let mut peers = vec![
+            peer("111111111", "Work PC"),
+            peer("222222222", "work pc"),
+            peer("333333333", "Laptop"),
+        ];
+        disambiguate_labels(&mut peers);
+        assert_eq!(peers[0].label, "Work PC (111 111 111)");
+        assert_eq!(peers[1].label, "work pc (222 222 222)");
+        assert_eq!(peers[2].label, "Laptop");
+    }
+
+    #[test]
+    fn menu_text_escapes_the_mnemonic_and_is_truncated() {
+        assert_eq!(sanitize_menu_text("A & B"), "A && B");
+        assert_eq!(sanitize_menu_text("a\nb"), "a b");
+        let long = "x".repeat(RECENT_LABEL_MAX_LEN + 5);
+        let sanitized = sanitize_menu_text(&long);
+        assert_eq!(sanitized.chars().count(), RECENT_LABEL_MAX_LEN + 1);
+    }
+
+    #[test]
+    fn only_url_safe_ids_are_used() {
+        assert!(is_url_safe_id("123456"));
+        assert!(is_url_safe_id("a-b_c.d"));
+        assert!(!is_url_safe_id("123 456"));
+        assert!(!is_url_safe_id("a/b"));
+        assert!(!is_url_safe_id(""));
+    }
 }
